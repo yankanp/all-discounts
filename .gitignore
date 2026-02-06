@@ -1,0 +1,15 @@
+# General
+.DS_Store
+.env
+*.log
+
+# Backend (Python)
+backend/venv/
+backend/__pycache__/
+*.pyc
+
+# Frontend (Next.js)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel

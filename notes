@@ -1,0 +1,16 @@
+cd backend
+source venv/bin/activate
+uvicorn main:app --reload
+
+cd frontend
+npm run dev
+
+#stop
+
+# Stop Backend
+pkill -f uvicorn
+
+# Stop Frontend
+pkill -f "next-server"
+# OR usually for dev server
+pkill -f node
