@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 import os
 import urllib.parse
 import json
@@ -9,7 +9,6 @@ import logging
 import base64
 from typing import Optional
 from services.gmail import GmailService
-from agents.extractor import ExtractorAgent
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -17,22 +16,23 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = "http://localhost:8000/auth/callback" 
 
-# In-Memory Cache for Tokens (Exchange code for token -> Store here -> Stream uses it)
-# token_id -> token_data (dict)
-# Structure: { ...token, 'start_timestamp': float }
+# In-Memory Cache for Tokens
 TOKEN_CACHE = {}
 
 @router.get("/login")
-def login_url(last_scan: Optional[str] = None):
+def login_url(scan_history: Optional[str] = None):
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
          return JSONResponse(content={"error": "Missing Server Credentials in .env"}, status_code=500)
 
     # Encode state
     state_data = {}
-    if last_scan:
-        state_data['last_scan'] = last_scan
+    if scan_history:
+        try:
+            # It's a JSON string of { email: timestamp_str }
+            state_data['scan_history'] = json.loads(scan_history)
+        except:
+            pass
     
-    # Simple base64 encoding for state to survive the redirect chain
     state_json = json.dumps(state_data)
     state = base64.urlsafe_b64encode(state_json.encode()).decode()
 
@@ -70,15 +70,31 @@ async def callback(code: str, state: Optional[str] = None):
     token_data["client_id"] = GOOGLE_CLIENT_ID
     token_data["client_secret"] = GOOGLE_CLIENT_SECRET
 
-    # Decode state to get last_scan
+
     start_timestamp = None
     if state:
         try:
             state_json = base64.urlsafe_b64decode(state.encode()).decode()
             data = json.loads(state_json)
-            start_timestamp = data.get('last_scan')
-            if start_timestamp:
-                start_timestamp = float(start_timestamp) / 1000.0 # Convert js ms to python seconds
+            
+            # Support both legacy last_scan and new scan_history
+            if 'scan_history' in data:
+                 history = data['scan_history']
+                 
+                 # We need the user's email to pick the right timestamp
+                 # We have the access_token in token_data, so we can fetch profile now
+                 from services.gmail import GmailService
+                 temp_service = GmailService(token_data)
+                 user_profile = temp_service.get_user_profile()
+                 email_address = user_profile.get('emailAddress')
+                 
+                 if email_address and email_address in history:
+                     ts = history[email_address]
+                     start_timestamp = float(ts) / 1000.0
+            
+            elif 'last_scan' in data:
+                 start_timestamp = float(data['last_scan']) / 1000.0
+
         except Exception as e:
             logging.error(f"State decode error: {e}")
 
@@ -88,70 +104,35 @@ async def callback(code: str, state: Optional[str] = None):
     token_id = str(uuid.uuid4())
     TOKEN_CACHE[token_id] = token_data
     
-    # Redirect to Frontend Scanning Page
+    # Always redirect to Scanning (which is now WebLLM only)
     return RedirectResponse(url=f"http://localhost:3000/scanning?token={token_id}")
 
-@router.get("/stream/{token_id}")
-def stream_scan(token_id: str):
+@router.get("/raw_messages/{token_id}")
+def get_raw_messages(token_id: str):
+    """
+    Fetches raw emails for Client-Side AI processing.
+    """
     token_data = TOKEN_CACHE.get(token_id)
     if not token_data:
         return JSONResponse(content={"error": "Invalid Token ID"}, status_code=404)
 
     start_timestamp = token_data.get("start_timestamp")
+    gmail_service = GmailService(token_data)
+    
+    # Get User Email
+    user_profile = gmail_service.get_user_profile()
+    email_address = user_profile.get('emailAddress', 'unknown')
 
-    # We use a generator logic here
-    def event_generator():
-        try:
-            yield f"event: log\ndata: {json.dumps({'msg': 'Initializing Gmail Service...'})}\n\n"
-            
-            gmail_service = GmailService(token_data)
-            
-            if start_timestamp:
-                import datetime
-                date_str = datetime.datetime.fromtimestamp(start_timestamp).strftime('%Y-%m-%d')
-                yield f"event: log\ndata: {json.dumps({'msg': f'Searching new emails since {date_str}...'})}\n\n"
-            else:
-                yield f"event: log\ndata: {json.dumps({'msg': 'Full Scan: Last 6 months...'})}\n\n"
-            
-            # Fetch 60 emails as requested for production
-            emails = gmail_service.fetch_promotional_emails(
-                max_results=60, 
-                start_timestamp=start_timestamp
-            )
-            
-            count = len(emails)
-            yield f"event: log\ndata: {json.dumps({'msg': f'Found {count} new emails. Starting AI extraction...'})}\n\n"
-            
-            extractor = ExtractorAgent()
-            final_coupons = []
-            
-            # Run generator
-            for event in extractor.process_emails_gen(emails):
-                if event['type'] == 'coupon':
-                    final_coupons.append(event['data'].dict())
-                    # Log the success
-                    yield f"event: log\ndata: {json.dumps({'msg': 'Saved Coupon', 'type': 'success'})}\n\n"
-                
-                elif event['type'] == 'log':
-                    yield f"event: log\ndata: {json.dumps(event)}\n\n"
-                
-                elif event['type'] == 'progress':
-                    yield f"event: progress\ndata: {json.dumps(event)}\n\n"
-            
-            # DONE
-            completion_payload = {
-                "msg": "Scan Complete", 
-                "count": len(final_coupons),
-                "coupons": final_coupons
-            }
-            yield f"event: complete\ndata: {json.dumps(completion_payload, default=str)}\n\n"
-            
-            # Cleanup
-            if token_id in TOKEN_CACHE:
-                del TOKEN_CACHE[token_id]
-
-        except Exception as e:
-            logging.error(f"Stream Error: {e}")
-            yield f"event: log\ndata: {json.dumps({'msg': f'Error: {str(e)}', 'type': 'error'})}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    # Fetch latest emails
+    emails = gmail_service.fetch_promotional_emails(
+        max_results=60, 
+        start_timestamp=start_timestamp
+    )
+    
+    if token_id in TOKEN_CACHE:
+         del TOKEN_CACHE[token_id]
+         
+    return {
+        "email": email_address,
+        "messages": emails
+    }

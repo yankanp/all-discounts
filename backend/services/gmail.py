@@ -12,6 +12,12 @@ class GmailService:
         self.creds = Credentials.from_authorized_user_info(token_info)
         self.service = build('gmail', 'v1', credentials=self.creds)
 
+    def get_user_profile(self) -> Dict:
+        """
+        Fetches the user's profile information.
+        """
+        return self.service.users().getProfile(userId='me').execute()
+
     def fetch_promotional_emails(self, max_results: int = 60, months_back: int = 6, start_timestamp: Optional[float] = None) -> List[Dict]:
         """
         Fetches the latest emails from 'CATEGORY_PROMOTIONS'.
